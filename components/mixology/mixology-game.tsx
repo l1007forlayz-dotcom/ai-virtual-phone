@@ -6,18 +6,18 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { ChevronLeft, Copy, History, MoreHorizontal, Pencil, Plus, RotateCcw, Send, Sun, WandSparkles, X } from "lucide-react";
-import { continueMix, editMixTurn, generateMixReply, mixTurnRawText, refreshMixOpening, regenerateMixTail, rerollMixReply, runMixSessionEnd, truncateMixAfterTurn } from "@/lib/mixology/engine";
+import { continueMix, editMixTurn, generateMixReply, MIX_REPAIR_EVENT, mixTurnRawText, refreshMixOpening, regenerateMixTail, rerollMixReply, runMixSessionEnd, truncateMixAfterTurn, type MixRepairEventDetail } from "@/lib/mixology/engine";
 import { getMixMaterial, getMixSession, listMixPickables, MIX_CABINET_UPDATED_EVENT, resolveMixRecipeMaterials, saveMixSession } from "@/lib/mixology/storage";
 import { applyMixMacros, MIX_DEFAULT_USER_NAME } from "@/lib/mixology/assembler";
 import { buildMixConditionContext, pickActiveMixMaterials } from "@/lib/mixology/state";
 import { scopeMixCss } from "@/lib/mixology/css-scope";
-import { MIX_KIND_LABELS, MIX_SLOT_ORDER, mixEncoreRenderHtml, mixPanelLayoutOf, mixSlotEntries, mixTurnEncoreBlocks, mixTurnTicketBlocks, type MixCharacterCard, type MixFilterRule, type MixMaterialKind, type MixMechanismMaterial, type MixPanelLayout, type MixSession, type MixSlotEntry, type MixState, type MixTicketMaterial, type MixTurn } from "@/lib/mixology/types";
+import { MIX_KIND_LABELS, MIX_SLOT_ORDER, mixEncoreRenderHtml, mixPanelLayoutOf, mixPanelSlotOf, mixSlotEntries, mixTurnEncoreBlocks, mixTurnTicketBlocks, type MixCharacterCard, type MixFilterRule, type MixMaterialKind, type MixMechanismMaterial, type MixPanelLayout, type MixSession, type MixSlotEntry, type MixState, type MixTicketMaterial, type MixTurn } from "@/lib/mixology/types";
 import { applyMixFilterRules, mixStreamText } from "@/lib/mixology/prose";
 import { MixProseView } from "./prose-view";
 import { MixRichText } from "./rich-text";
 import { KindGlyph, MixConfirm } from "./mixology-shared";
 import { MixTicketFrame } from "./ticket-frame";
-import { MixMechanismPanel } from "./mechanism-panel";
+import { MixMechanismInline, MixMechanismPanel } from "./mechanism-panel";
 
 /** 当前真正挂着的对局：严格模式的重复挂载靠它区分「真退出」与「假卸载」 */
 const liveMixGames = new Set<string>();
@@ -173,6 +173,22 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         window.addEventListener(MIX_CABINET_UPDATED_EVENT, bump);
         return () => window.removeEventListener(MIX_CABINET_UPDATED_EVENT, bump);
     }, []);
+    /**
+     * 状态栏补写提示：补写是流式结束后追加的一次模型往返，屏幕上没有任何
+     * 东西在动——引擎广播事件，这里挂一个半透明小 toast 告诉用户在补什么。
+     */
+    const [repairNote, setRepairNote] = useState<string | null>(null);
+    useEffect(() => {
+        const onRepair = (event: Event) => {
+            const detail = (event as CustomEvent<MixRepairEventDetail>).detail;
+            if (!detail || detail.sessionId !== sessionId) return;
+            setRepairNote(detail.done ? null : detail.name ?? "");
+        };
+        window.addEventListener(MIX_REPAIR_EVENT, onRepair);
+        return () => window.removeEventListener(MIX_REPAIR_EVENT, onRepair);
+    }, [sessionId]);
+    // 兜底：这轮怎么收场的都别让 toast 挂着（引擎侧异常路径已在 finally 里收过一道）
+    useEffect(() => { if (!busy) setRepairNote(null); }, [busy]);
     const scrollRef = useRef<HTMLDivElement | null>(null);
     const abortRef = useRef<AbortController | null>(null);
     const wheelRef = useRef<HTMLDivElement | null>(null);
@@ -267,6 +283,49 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
             })
             .filter((item): item is { material: MixMechanismMaterial; layout: MixPanelLayout } => item !== null);
     }, [session, cabinetTick]);
+
+    /**
+     * 按挂点分组：float 走悬浮层（老形态），header/inputbar-* 由宿主画按钮开合，
+     * flow-* 作为内嵌卡进滚动流。按钮与容器都是宿主画的，沙盒只管格子里的内容。
+     */
+    const slotGroups = useMemo(() => {
+        const groups = {
+            float: [] as typeof panels,
+            header: [] as typeof panels,
+            "inputbar-left": [] as typeof panels,
+            "inputbar-right": [] as typeof panels,
+            "flow-top": [] as typeof panels,
+            "flow-bottom": [] as typeof panels,
+        };
+        for (const item of panels) groups[mixPanelSlotOf(item.layout)].push(item);
+        return groups;
+    }, [panels]);
+
+    /**
+     * 回传轮数：默认不限（全部历史都发给模型），玩家在修改方案弹窗里调了才裁。
+     * 只裁请求内容，存储与界面回放完整；随对局保存。
+     */
+    const [histOpen, setHistOpen] = useState(false);
+    const setHistoryLimit = useCallback((limit: number | undefined) => {
+        const current = getMixSession(sessionId);
+        if (!current) return;
+        const next: MixSession = { ...current };
+        if (limit && limit > 0) next.historyLimit = Math.floor(limit);
+        else delete next.historyLimit;
+        saveMixSession(next);
+        setSession(getMixSession(sessionId));
+    }, [sessionId]);
+
+    /** 按钮位面板的开合，按局记忆；关着的不渲染（要留住的状态放机括存储桶） */
+    const dockOpen = session?.panelOpen ?? {};
+    const toggleDock = useCallback((materialId: string) => {
+        const current = getMixSession(sessionId);
+        if (!current) return;
+        const next = { ...(current.panelOpen ?? {}) };
+        next[materialId] = !next[materialId];
+        saveMixSession({ ...current, panelOpen: next });
+        setSession(getMixSession(sessionId));
+    }, [sessionId]);
 
     /**
      * 机括界面的逃生口。摆放完全交给创作者之后，理论上存在"一块面板糊满整个屏幕、
@@ -713,6 +772,19 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
             <div className="mix-game-header">
                 <button type="button" className="mix-icon-btn" onClick={onBack} aria-label="返回"><ChevronLeft size={20} /></button>
                 <div className="mix-game-title">{session.charName}</div>
+                {slotGroups.header.map(({ material, layout }) => (
+                    <button
+                        key={material.id}
+                        type="button"
+                        className="mix-icon-btn mix-slot-btn"
+                        data-on={dockOpen[material.id] ? "true" : undefined}
+                        onClick={() => toggleDock(material.id)}
+                        aria-label={material.name}
+                        title={material.name}
+                    >
+                        {layout.icon || "◈"}
+                    </button>
+                ))}
                 <button type="button" className="mix-icon-btn" onClick={() => setBgTuneOpen((v) => !v)} aria-label="背景观感" title="背景观感">
                     <Sun size={19} />
                 </button>
@@ -751,6 +823,24 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                 </>
             ) : null}
             <StateBar state={session.state ?? {}} />
+            {!panelsHidden && slotGroups.header.some(({ material }) => dockOpen[material.id]) ? (
+                <div className="mix-dock-drop" data-from="header">
+                    {slotGroups.header.filter(({ material }) => dockOpen[material.id]).map(({ material, layout }) => (
+                        <MixMechanismInline
+                            key={material.id}
+                            materialId={material.id}
+                            name={material.name}
+                            html={material.panelHtml ?? ""}
+                            state={session.state ?? {}}
+                            store={session.mechanismStore?.[material.id] ?? {}}
+                            plateDefault={layout.plate !== false}
+                            onStore={handlePanelStore}
+                            onState={handlePanelState}
+                            onSay={handlePanelSay}
+                        />
+                    ))}
+                </div>
+            ) : null}
             <div
                 className="mix-game-scroll"
                 ref={scrollRef}
@@ -766,6 +856,21 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                         <MixRichText text={assets.canvasHtml} />
                     </div>
                 ) : null}
+                {slotGroups["flow-top"].map(({ material, layout }) => (
+                    <div className="mix-flow-panel" data-at="top" key={material.id}>
+                        <MixMechanismInline
+                            materialId={material.id}
+                            name={material.name}
+                            html={material.panelHtml ?? ""}
+                            state={session.state ?? {}}
+                            store={session.mechanismStore?.[material.id] ?? {}}
+                            plateDefault={layout.plate !== false}
+                            onStore={handlePanelStore}
+                            onState={handlePanelState}
+                            onSay={handlePanelSay}
+                        />
+                    </div>
+                ))}
                 {session.turns.map((turn, idx) => {
                     const isLast = idx === session.turns.length - 1;
                     const actions = (
@@ -804,15 +909,30 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                         </div>
                     );
                 })() : null}
+                {slotGroups["flow-bottom"].map(({ material, layout }) => (
+                    <div className="mix-flow-panel" data-at="bottom" key={material.id}>
+                        <MixMechanismInline
+                            materialId={material.id}
+                            name={material.name}
+                            html={material.panelHtml ?? ""}
+                            state={session.state ?? {}}
+                            store={session.mechanismStore?.[material.id] ?? {}}
+                            plateDefault={layout.plate !== false}
+                            onStore={handlePanelStore}
+                            onState={handlePanelState}
+                            onSay={handlePanelSay}
+                        />
+                    </div>
+                ))}
                 {assets.encoreStatics.map((item) => (
                     <div className="mix-encore-inline" key={item.id}>
                         <MixRichText text={item.html} />
                     </div>
                 ))}
             </div>
-            {panels.length && !panelsHidden ? (
+            {slotGroups.float.length && !panelsHidden ? (
                 <div className="mix-panel-layer">
-                    {panels.map(({ material, layout }) => (
+                    {slotGroups.float.map(({ material, layout }) => (
                         <MixMechanismPanel
                             key={material.id}
                             materialId={material.id}
@@ -829,7 +949,44 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                     ))}
                 </div>
             ) : null}
+            {!panelsHidden && [...slotGroups["inputbar-left"], ...slotGroups["inputbar-right"]].some(({ material }) => dockOpen[material.id]) ? (
+                <div className="mix-dock-drop" data-from="input">
+                    {[...slotGroups["inputbar-left"], ...slotGroups["inputbar-right"]].filter(({ material }) => dockOpen[material.id]).map(({ material, layout }) => (
+                        <MixMechanismInline
+                            key={material.id}
+                            materialId={material.id}
+                            name={material.name}
+                            html={material.panelHtml ?? ""}
+                            state={session.state ?? {}}
+                            store={session.mechanismStore?.[material.id] ?? {}}
+                            plateDefault={layout.plate !== false}
+                            onStore={handlePanelStore}
+                            onState={handlePanelState}
+                            onSay={handlePanelSay}
+                        />
+                    ))}
+                </div>
+            ) : null}
+            {repairNote !== null ? (
+                <div className="mix-repair-toast" role="status">
+                    <span className="mix-repair-dots" aria-hidden="true"><i /><i /><i /></span>
+                    {repairNote ? `「${repairNote}」状态栏补写中` : "状态栏补写中"}
+                </div>
+            ) : null}
             <div className="mix-game-inputbar">
+                {slotGroups["inputbar-left"].map(({ material, layout }) => (
+                    <button
+                        key={material.id}
+                        type="button"
+                        className="mix-icon-btn mix-slot-btn"
+                        data-on={dockOpen[material.id] ? "true" : undefined}
+                        onClick={() => toggleDock(material.id)}
+                        aria-label={material.name}
+                        title={material.name}
+                    >
+                        {layout.icon || "◈"}
+                    </button>
+                ))}
                 <button
                     type="button"
                     className="mix-icon-btn"
@@ -864,6 +1021,19 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                 >
                     <WandSparkles size={18} />
                 </button>
+                {slotGroups["inputbar-right"].map(({ material, layout }) => (
+                    <button
+                        key={material.id}
+                        type="button"
+                        className="mix-icon-btn mix-slot-btn"
+                        data-on={dockOpen[material.id] ? "true" : undefined}
+                        onClick={() => toggleDock(material.id)}
+                        aria-label={material.name}
+                        title={material.name}
+                    >
+                        {layout.icon || "◈"}
+                    </button>
+                ))}
                 <button type="button" className="mix-send-btn" onClick={handleSend} disabled={busy || !input.trim()} aria-label="发送">
                     <Send size={16} />
                 </button>
@@ -879,14 +1049,39 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                         </div>
                         <div className="mix-sheet-body">
                             <div className="mix-struct-note">只改这一局，下一轮生成时生效，已写出的内容不变；不影响吧台里保存的方案。</div>
-                            {panels.length ? (
-                                <div className="mix-panel-ops">
-                                    <button type="button" className="mix-dock-chip" data-on={panelsHidden ? "true" : undefined} onClick={() => setPanelsHidden((v) => !v)}>
-                                        {panelsHidden ? "显示机括界面" : "暂时收起机括界面"}
-                                    </button>
-                                    <button type="button" className="mix-dock-chip" onClick={() => { resetPanelBoxes(); onToast("机括界面已归位。"); }}>
-                                        界面归位
-                                    </button>
+                            <div className="mix-panel-ops">
+                                {panels.length ? (
+                                    <>
+                                        <button type="button" className="mix-dock-chip" data-on={panelsHidden ? "true" : undefined} onClick={() => setPanelsHidden((v) => !v)}>
+                                            {panelsHidden ? "显示机括界面" : "暂时收起机括界面"}
+                                        </button>
+                                        <button type="button" className="mix-dock-chip" onClick={() => { resetPanelBoxes(); onToast("机括界面已归位。"); }}>
+                                            界面归位
+                                        </button>
+                                    </>
+                                ) : null}
+                                <button
+                                    type="button"
+                                    className="mix-dock-chip"
+                                    data-on={session.historyLimit || histOpen ? "true" : undefined}
+                                    onClick={() => setHistOpen((v) => !v)}
+                                >
+                                    {session.historyLimit ? `回传近 ${session.historyLimit} 轮` : "回传全部历史"}
+                                </button>
+                            </div>
+                            {histOpen ? (
+                                <div className="mix-histlimit">
+                                    <span>回传轮数</span>
+                                    <input
+                                        type="range"
+                                        min={2}
+                                        max={60}
+                                        step={1}
+                                        value={session.historyLimit ?? 60}
+                                        onChange={(e) => setHistoryLimit(Number(e.target.value))}
+                                    />
+                                    <b>{session.historyLimit ?? "不限"}</b>
+                                    <button type="button" className="mix-dock-chip" onClick={() => setHistoryLimit(undefined)}>不限</button>
                                 </div>
                             ) : null}
                             <div className="mix-bar-hint">左右滑动切换槽位 · 点击槽位换材料</div>
